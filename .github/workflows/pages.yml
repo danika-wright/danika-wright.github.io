@@ -1,0 +1,85 @@
+name: Publish and take down
+
+# Every page may carry <meta name="takedown" content="YYYY-MM-DD">.
+# From that date (Sydney time) the page's folder is deleted from main
+# and the site is redeployed without it. Runs hourly so the takedown
+# lands within about an hour of midnight, Sydney time.
+
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      removed: ${{ steps.prune.outputs.removed }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - id: prune
+        name: Remove pages whose takedown date has arrived
+        run: |
+          today=$(TZ=Australia/Sydney date +%F)
+          echo "Today in Sydney: $today"
+          removed=""
+          while IFS= read -r -d '' f; do
+            [ -e "$f" ] || continue
+            d=$(grep -oE '<meta name="takedown" content="[0-9]{4}-[0-9]{2}-[0-9]{2}"' "$f" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -n1 || true)
+            [ -n "$d" ] || continue
+            if [[ "$today" < "$d" ]]; then
+              echo "keep       $f (comes down $d)"
+              continue
+            fi
+            dir=$(dirname "$f")
+            if [ "$dir" = "." ]; then target="$f"; else target="$dir"; fi
+            echo "TAKE DOWN  $target (takedown $d)"
+            git rm -rq -- "$target"
+            removed="$removed $target"
+          done < <(git ls-files -z -- '*.html')
+          if [ -n "$removed" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -q -m "Take down:$removed"
+            git push origin HEAD:main
+            echo "removed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "removed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  deploy:
+    needs: prune
+    # Scheduled runs only redeploy when something came down.
+    if: github.event_name != 'schedule' || needs.prune.outputs.removed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - name: Assemble the site (everything except README and .github)
+        run: |
+          mkdir _site
+          git ls-files -z -- . ':!:.github' ':!:README.md' | xargs -0 -I{} cp --parents -- {} _site/
+          find _site -type f | sort
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+      - id: deployment
+        uses: actions/deploy-pages@v4
